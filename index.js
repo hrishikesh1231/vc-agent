@@ -1,15 +1,13 @@
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
-const path = require("path");
 const WebSocket = require("ws");
 const twilio = require("twilio");
 const OpenAI = require("openai");
 const { createClient } = require("@deepgram/sdk");
-
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
-// Clients
+// Initialize Clients
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -20,69 +18,80 @@ const wss = new WebSocket.Server({ noServer: true });
 
 app.use(express.urlencoded({ extended: true }));
 
-// Memory for conversations
+// Store conversation history per call
 const conversationHistories = new Map();
 
-// ✅ Start call
-app.get('/start-call', async (req, res) => {
+/**
+ * Start call
+ */
+app.get("/start-call", async (req, res) => {
     try {
         const call = await twilioClient.calls.create({
             url: `${process.env.SERVER_BASE_URL}/handle-call`,
             to: process.env.YOUR_PHONE_NUMBER,
             from: process.env.TWILIO_PHONE_NUMBER,
             statusCallback: `${process.env.SERVER_BASE_URL}/call-status`,
-            statusCallbackMethod: 'POST',
-            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
+            statusCallbackMethod: "POST",
+            statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
         });
+
         res.send(`✅ Call started! SID: ${call.sid}`);
     } catch (err) {
-        console.error('❌ Error starting call:', err);
+        console.error("❌ Error starting call:", err);
         res.status(500).send(err.message);
     }
 });
 
-// ✅ Handle Twilio call
-app.post('/handle-call', (req, res) => {
+/**
+ * Handle Twilio incoming call
+ */
+app.post("/handle-call", (req, res) => {
     const twiml = new VoiceResponse();
 
-    // Enable bidirectional audio streaming
-    const start = twiml.start();
-    start.stream({
+    // Start Twilio <Stream> for real-time audio
+    twiml.start().stream({
         url: `${process.env.SERVER_BASE_URL}/media-stream`,
-        track: "both_tracks"  // ✅ FIXED
+        track: "inbound_track"
     });
 
-    // Send greeting
-    twiml.say({ voice: 'Polly.Joanna' }, "Hello Hrishi! I'm your AI voice agent. How are you today?");
-    twiml.pause({ length: 60 }); // Keep call alive
+    // Greet user
+    twiml.say({ voice: "Polly.Joanna" }, "Hello Hrishi! I'm your AI voice agent. How are you today?");
 
-    res.type('text/xml');
+    // Keep call alive
+    twiml.pause({ length: 60 });
+
+    res.type("text/xml");
     res.send(twiml.toString());
 });
 
-// ✅ Call status webhook
+/**
+ * Call status tracking
+ */
 app.post("/call-status", (req, res) => {
     const callSid = req.body.CallSid;
     conversationHistories.delete(callSid);
     res.sendStatus(200);
 });
 
-// ✅ WebSocket Upgrade for Twilio
-server.on('upgrade', (req, socket, head) => {
-    if (req.url === '/media-stream') {
+/**
+ * Upgrade WebSocket for Twilio media streaming
+ */
+server.on("upgrade", (req, socket, head) => {
+    if (req.url === "/media-stream") {
         wss.handleUpgrade(req, socket, head, (ws) => {
-            wss.emit('connection', ws, req);
+            wss.emit("connection", ws, req);
         });
     } else {
         socket.destroy();
     }
 });
 
-// ✅ WebSocket connection handler
+/**
+ * WebSocket connection for real-time audio
+ */
 wss.on("connection", async (ws, req) => {
     console.log("🔗 Twilio connected to media stream");
 
-    // ✅ Deepgram Live Listening
     const dgLive = deepgram.listen.live({
         model: "nova-2",
         encoding: "mulaw",
@@ -94,27 +103,29 @@ wss.on("connection", async (ws, req) => {
 
     dgLive.addListener("transcriptReceived", async (dgMsg) => {
         const transcript = dgMsg.channel.alternatives[0].transcript;
+
         if (transcript && transcript.trim() !== "") {
             console.log(`👤 User: ${transcript}`);
 
             const reply = await getAgentResponse(transcript, "call-1");
             console.log(`🤖 Agent: ${reply}`);
 
-            // Generate TTS reply
+            // Generate TTS in PCM for Twilio
             const audioBuffer = await generateSpeech(reply);
 
-            // Send back audio to Twilio
-            ws.send(JSON.stringify({
-                event: "media",
-                media: { payload: audioBuffer.toString("base64") }
-            }));
+            // Send audio back to Twilio in base64
+            ws.send(
+                JSON.stringify({
+                    event: "media",
+                    media: { payload: audioBuffer.toString("base64") }
+                })
+            );
         }
     });
 
     ws.on("message", (msg) => {
         const data = JSON.parse(msg);
         if (data.event === "media" && data.media?.payload) {
-            // ✅ Send audio chunks to Deepgram
             dgLive.send(data.media.payload);
         }
     });
@@ -125,7 +136,9 @@ wss.on("connection", async (ws, req) => {
     });
 });
 
-// ✅ GPT response generator
+/**
+ * Get GPT response
+ */
 async function getAgentResponse(userText, callSid) {
     let history = conversationHistories.get(callSid) || [
         { role: "system", content: "You are a friendly AI voice agent. Keep responses short and natural." }
@@ -145,7 +158,9 @@ async function getAgentResponse(userText, callSid) {
     return reply;
 }
 
-// ✅ Generate TTS from Deepgram
+/**
+ * Generate speech via Deepgram TTS
+ */
 async function generateSpeech(text) {
     const response = await deepgram.speak.request(
         { text },
@@ -153,13 +168,8 @@ async function generateSpeech(text) {
     );
 
     const stream = await response.getStream();
-    return await getAudioBuffer(stream);
-}
-
-// ✅ Helper for streaming audio
-async function getAudioBuffer(response) {
-    const reader = response.getReader();
     const chunks = [];
+    const reader = stream.getReader();
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
