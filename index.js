@@ -2,11 +2,11 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const path = require("path");
-const fs = require("fs");
 const WebSocket = require("ws");
 const twilio = require("twilio");
 const OpenAI = require("openai");
 const { createClient } = require("@deepgram/sdk");
+
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // Clients
@@ -19,7 +19,6 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static("public"));
 
 // Memory for conversations
 const conversationHistories = new Map();
@@ -33,7 +32,7 @@ app.get('/start-call', async (req, res) => {
             from: process.env.TWILIO_PHONE_NUMBER,
             statusCallback: `${process.env.SERVER_BASE_URL}/call-status`,
             statusCallbackMethod: 'POST',
-            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'] // ✅ VALID EVENTS
+            statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
         });
         res.send(`✅ Call started! SID: ${call.sid}`);
     } catch (err) {
@@ -46,17 +45,16 @@ app.get('/start-call', async (req, res) => {
 app.post('/handle-call', (req, res) => {
     const twiml = new VoiceResponse();
 
-    // Start streaming audio to /media-stream
-    twiml.start().stream({
+    // Enable bidirectional audio streaming
+    const start = twiml.start();
+    start.stream({
         url: `${process.env.SERVER_BASE_URL}/media-stream`,
-        track: "inbound_track"
+        track: "both_tracks"  // ✅ FIXED
     });
 
-    // Greeting message
+    // Send greeting
     twiml.say({ voice: 'Polly.Joanna' }, "Hello Hrishi! I'm your AI voice agent. How are you today?");
-
-    // Keep the call alive for 60 seconds
-    twiml.pause({ length: 60 });
+    twiml.pause({ length: 60 }); // Keep call alive
 
     res.type('text/xml');
     res.send(twiml.toString());
@@ -69,7 +67,7 @@ app.post("/call-status", (req, res) => {
     res.sendStatus(200);
 });
 
-// ✅ WebSocket Upgrade for Twilio media stream
+// ✅ WebSocket Upgrade for Twilio
 server.on('upgrade', (req, socket, head) => {
     if (req.url === '/media-stream') {
         wss.handleUpgrade(req, socket, head, (ws) => {
@@ -84,6 +82,7 @@ server.on('upgrade', (req, socket, head) => {
 wss.on("connection", async (ws, req) => {
     console.log("🔗 Twilio connected to media stream");
 
+    // ✅ Deepgram Live Listening
     const dgLive = deepgram.listen.live({
         model: "nova-2",
         encoding: "mulaw",
@@ -95,24 +94,27 @@ wss.on("connection", async (ws, req) => {
 
     dgLive.addListener("transcriptReceived", async (dgMsg) => {
         const transcript = dgMsg.channel.alternatives[0].transcript;
-
         if (transcript && transcript.trim() !== "") {
             console.log(`👤 User: ${transcript}`);
 
             const reply = await getAgentResponse(transcript, "call-1");
             console.log(`🤖 Agent: ${reply}`);
 
-            // Generate TTS
+            // Generate TTS reply
             const audioBuffer = await generateSpeech(reply);
 
-            // Send raw PCM back to Twilio
-            ws.send(JSON.stringify({ event: "media", media: { payload: audioBuffer.toString("base64") } }));
+            // Send back audio to Twilio
+            ws.send(JSON.stringify({
+                event: "media",
+                media: { payload: audioBuffer.toString("base64") }
+            }));
         }
     });
 
     ws.on("message", (msg) => {
         const data = JSON.parse(msg);
         if (data.event === "media" && data.media?.payload) {
+            // ✅ Send audio chunks to Deepgram
             dgLive.send(data.media.payload);
         }
     });
@@ -143,7 +145,7 @@ async function getAgentResponse(userText, callSid) {
     return reply;
 }
 
-// ✅ Deepgram TTS generator (returns raw audio buffer)
+// ✅ Generate TTS from Deepgram
 async function generateSpeech(text) {
     const response = await deepgram.speak.request(
         { text },
@@ -151,10 +153,10 @@ async function generateSpeech(text) {
     );
 
     const stream = await response.getStream();
-    const buffer = await getAudioBuffer(stream);
-    return buffer;
+    return await getAudioBuffer(stream);
 }
 
+// ✅ Helper for streaming audio
 async function getAudioBuffer(response) {
     const reader = response.getReader();
     const chunks = [];
